@@ -345,7 +345,9 @@ def export_hv0713():
     logger.info("HV0713 exported: %s", filename)
     return _xlsx_response(xlsx_bytes, filename)
 
-# ── Dev server ────────────────────────────────────────────────────────────────
+@app.route("/api/health", methods=["GET"])
+def health():
+    return jsonify({"status":"ok","ha0935_template":HA0935_TEMPLATE.is_file(),"hv0713_template":HV0713_TEMPLATE.is_file()})# ── Dev server ────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=False)
