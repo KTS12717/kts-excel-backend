@@ -1,120 +1,257 @@
 """
-app.py  —  KTS Excel Export Backend
-=====================================
-Python Flask server that:
-  1. Receives JSON export data from the HTML frontend
-  2. Loads the real .xlsx template (never modifies it)
-  3. Writes ONLY approved yellow input cells
-  4. Returns a finished, download-ready .xlsx file
-
-Run locally:
-    pip install flask openpyxl
-    python app.py
-
-Deploy (Render / Railway / Fly.io):
-    See README.md for deployment instructions.
-
-CORS:
-  Set ALLOWED_ORIGIN in the environment to your GitHub Pages URL.
-  Example: ALLOWED_ORIGIN=https://kts12717.github.io
+app.py  —  KTS Excel Export Backend (single-file version)
+==========================================================
+Everything merged into one file — no subfolders needed.
+Just upload this app.py to GitHub and Render will run it.
 """
 
 from __future__ import annotations
 
+import io
 import logging
 import os
-from datetime import date
+import shutil
+import tempfile
+from datetime import date, datetime
 from pathlib import Path
+from typing import Any, Dict, Optional
 
 from flask import Flask, jsonify, request, send_file
 from flask_cors import CORS
-import io
-
-from exporters.ha0935 import build_ha0935, HA0935Data
-from exporters.hv0713 import build_hv0713, HV0713Data
+import openpyxl
+from openpyxl.cell.cell import MergedCell
+from openpyxl.styles.fills import FILL_SOLID
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s %(levelname)-8s %(name)s  %(message)s",
+    format="%(asctime)s %(levelname)-8s %(message)s",
 )
 logger = logging.getLogger(__name__)
 
 # ── App setup ─────────────────────────────────────────────────────────────────
 app = Flask(__name__)
-
-# Allow requests only from your GitHub Pages domain in production.
-# Set ALLOWED_ORIGIN env var; default allows all origins for local dev.
 ALLOWED_ORIGIN = os.environ.get("ALLOWED_ORIGIN", "*")
 CORS(app, resources={r"/api/*": {"origins": ALLOWED_ORIGIN}})
 
-# ── Template paths ────────────────────────────────────────────────────────────
-BASE_DIR = Path(__file__).parent
-TEMPLATES_DIR = BASE_DIR / "templates_excel"
-
+BASE_DIR       = Path(__file__).parent
+TEMPLATES_DIR  = BASE_DIR / "templates_excel"
 HA0935_TEMPLATE = TEMPLATES_DIR / "HA0935_template.xlsx"
 HV0713_TEMPLATE = TEMPLATES_DIR / "HV0713_template.xlsx"
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# ── Yellow-cell helpers ───────────────────────────────────────────────────────
+_YELLOW_SUFFIX = "FFFF99"
 
+def is_yellow(cell) -> bool:
+    try:
+        return (
+            cell.fill is not None
+            and cell.fill.fill_type == FILL_SOLID
+            and cell.fill.fgColor.rgb.upper().endswith(_YELLOW_SUFFIX)
+        )
+    except Exception:
+        return False
+
+def _letter(col: int) -> str:
+    s = ""
+    while col > 0:
+        col, r = divmod(col - 1, 26)
+        s = chr(65 + r) + s
+    return s
+
+def safe_write(ws, row: int, col: int, value: Any) -> bool:
+    cell = ws.cell(row=row, column=col)
+    if isinstance(cell, MergedCell):
+        return False
+    if isinstance(cell.value, str) and cell.value.startswith("="):
+        raise RuntimeError(f"Formula-overwrite blocked at {ws.title}!{_letter(col)}{row}")
+    if not is_yellow(cell):
+        logger.error("SAFETY: %s!%s%d is not yellow — write rejected.", ws.title, _letter(col), row)
+        return False
+    cell.value = value
+    return True
+
+# ── Template loader ───────────────────────────────────────────────────────────
+def load_template(template_path: Path):
+    if not template_path.is_file():
+        raise FileNotFoundError(f"Template not found: {template_path}")
+    tmp = tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False)
+    tmp.close()
+    tmp_path = Path(tmp.name)
+    shutil.copy2(template_path, tmp_path)
+    wb = openpyxl.load_workbook(str(tmp_path), data_only=False, keep_vba=False)
+    return wb, tmp_path
+
+def finish(wb, tmp_path: Path) -> bytes:
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    data = buf.read()
+    try:
+        tmp_path.unlink()
+    except Exception:
+        pass
+    return data
+
+# ── HA0935 writer ─────────────────────────────────────────────────────────────
+HA_ROUTE_NAMES    = ["Khan1","Khan2","Khan3","Khan4","Khan5","Khan6","Khan7","Khan8","Khan9","Khan10"]
+HA_OVO_FIRST_ROW  = 10
+HA_SSO_FIRST_ROW  = 41
+HA_DAY_COL_C      = 3
+
+def build_ha0935(template_path: Path, data: dict) -> bytes:
+    wb, tmp_path = load_template(template_path)
+
+    # Route Detail
+    ws = wb["Route Detail"]
+    ws["A2"].value = data["month_date"]
+
+    ovo = data.get("ovo", {})
+    for ri, route_name in enumerate(HA_ROUTE_NAMES):
+        am_row = HA_OVO_FIRST_ROW + ri * 2
+        pm_row = am_row + 1
+        route_ovo = ovo.get(route_name, {})
+        for period, row_num in [("AM", am_row), ("PM", pm_row)]:
+            for day, value in route_ovo.get(period, {}).items():
+                if value is None:
+                    continue
+                col = HA_DAY_COL_C + (int(day) - 1)
+                if col > 33:
+                    continue
+                safe_write(ws, row_num, col, value)
+
+    sso = data.get("sso", {})
+    for ri, route_name in enumerate(HA_ROUTE_NAMES):
+        row_num = HA_SSO_FIRST_ROW + ri
+        for day, miles in sso.get(route_name, {}).items():
+            col = HA_DAY_COL_C + (int(day) - 1)
+            if col > 33:
+                continue
+            safe_write(ws, row_num, col, float(miles))
+
+    if data.get("vehicle_unit_rate") is not None:
+        ws["C35"].value = float(data["vehicle_unit_rate"])
+    if data.get("contract_mile_rate") is not None:
+        ws["C56"].value = float(data["contract_mile_rate"])
+
+    # Daily Attendance Report
+    ws2 = wb["Daily Attendance Report"]
+    ws2["A2"].value = data["month_date"]
+    for row_str, day_codes in data.get("attendance", {}).items():
+        row_num = int(row_str)
+        for day_str, code in day_codes.items():
+            col = 7 + (int(day_str) - 1)   # col G = 7 = day 1
+            if col > 37:
+                continue
+            val = int(code) if str(code).lstrip("-").isdigit() else str(code).upper()
+            safe_write(ws2, row_num, col, val)
+
+    return finish(wb, tmp_path)
+
+# ── HV0713 writer ─────────────────────────────────────────────────────────────
+HV_OVO_ROW_MAP = {
+    "6770": {"AM": 9,  "PM": 10},
+    "6771": {"AM": 11, "PM": 12},
+}
+HV_SSO_ROW_MAP = {"6770": 24, "6771": 25}
+HV_DAY_COL_C   = 3
+
+def build_hv0713(template_path: Path, data: dict) -> bytes:
+    wb, tmp_path = load_template(template_path)
+
+    # Route Detail
+    ws = wb["Route Detail"]
+    ws["A2"].value = data["month_date"]
+
+    ovo = data.get("ovo", {})
+    for route_name, periods in ovo.items():
+        rows = HV_OVO_ROW_MAP.get(str(route_name), {})
+        for period, day_values in periods.items():
+            row_num = rows.get(period.upper())
+            if row_num is None:
+                continue
+            for day, value in day_values.items():
+                if value is None:
+                    continue
+                col = HV_DAY_COL_C + (int(day) - 1)
+                if col > 33:
+                    continue
+                safe_write(ws, row_num, col, value)
+
+    sso = data.get("sso", {})
+    for route_name, daily_miles in sso.items():
+        row_num = HV_SSO_ROW_MAP.get(str(route_name))
+        if row_num is None:
+            continue
+        for day, miles in daily_miles.items():
+            col = HV_DAY_COL_C + (int(day) - 1)
+            if col > 33:
+                continue
+            safe_write(ws, row_num, col, float(miles))
+
+    if data.get("vehicle_unit_rate") is not None:
+        ws["C18"].value = float(data["vehicle_unit_rate"])
+    if data.get("contract_mile_rate") is not None:
+        ws["C31"].value = float(data["contract_mile_rate"])
+
+    # Daily Attendance Report
+    ws2 = wb["Daily Attendance Report"]
+    ws2["A2"].value = data["month_date"]
+    for row_str, day_codes in data.get("attendance", {}).items():
+        row_num = int(row_str)
+        for day_str, code in day_codes.items():
+            col = 7 + (int(day_str) - 1)
+            if col > 37:
+                continue
+            val = int(code) if str(code).lstrip("-").isdigit() else str(code).upper()
+            safe_write(ws2, row_num, col, val)
+
+    return finish(wb, tmp_path)
+
+# ── Request helpers ───────────────────────────────────────────────────────────
 def _parse_date(raw: str) -> date:
-    """Parse 'YYYY-MM-DD' → datetime.date.  Raises ValueError on bad input."""
-    from datetime import datetime
-    d = datetime.strptime(raw.strip(), "%Y-%m-%d").date()
-    if d.day != 1:
-        raise ValueError(f"month_date must be the first of the month, got {raw!r}")
-    return d
+    return datetime.strptime(raw.strip(), "%Y-%m-%d").date()
 
+def _parse_body(body: dict) -> dict:
+    """Normalise JSON payload — convert string day keys to int, etc."""
+    month_date = _parse_date(body.get("month_date", ""))
+    if month_date.day != 1:
+        raise ValueError(f"month_date must be the 1st of the month, got {month_date}")
 
-def _parse_ovo(raw: dict) -> dict:
-    """
-    Convert JSON OVO payload to the format expected by the exporters.
-    JSON keys are strings; we need integer day keys.
-    Input:  {"6770": {"AM": {"2": 1, "3": 1, ...}, "PM": {...}}}
-    Output: {"6770": {"AM": {2: 1, 3: 1, ...}, "PM": {...}}}
-    """
-    result = {}
-    for route, periods in (raw or {}).items():
-        result[str(route)] = {
-            period.upper(): {int(k): int(v) for k, v in days.items()}
-            for period, days in periods.items()
+    def norm_ovo(raw):
+        result = {}
+        for route, periods in (raw or {}).items():
+            result[str(route)] = {
+                p.upper(): {int(k): int(v) for k, v in days.items()}
+                for p, days in periods.items()
+            }
+        return result
+
+    def norm_sso(raw):
+        return {
+            str(route): {int(k): float(v) for k, v in days.items()}
+            for route, days in (raw or {}).items()
         }
-    return result
 
+    def norm_att(raw):
+        result = {}
+        for row_str, days in (raw or {}).items():
+            result[row_str] = {
+                str(d): (int(c) if str(c).lstrip("-").isdigit() else str(c))
+                for d, c in days.items()
+            }
+        return result
 
-def _parse_sso(raw: dict) -> dict:
-    """
-    Convert JSON SSO payload.
-    Input:  {"6770": {"2": 251.0, "3": 243.0}}
-    Output: {"6770": {2: 251.0, 3: 243.0}}
-    """
-    result = {}
-    for route, days in (raw or {}).items():
-        result[str(route)] = {int(k): float(v) for k, v in days.items()}
-    return result
-
-
-def _parse_attendance(raw: dict) -> dict:
-    """
-    Convert JSON attendance payload.
-    Input:  {"13": {"2": 2, "3": "NS", ...}}
-    Output: {13: {2: 2, 3: "NS", ...}}
-    """
-    result = {}
-    for row_str, days in (raw or {}).items():
-        parsed_days = {}
-        for day_str, code in days.items():
-            # Numeric codes come as ints or int-strings; text codes as strings
-            if str(code).lstrip("-").isdigit():
-                parsed_days[int(day_str)] = int(code)
-            else:
-                parsed_days[int(day_str)] = str(code).upper()
-        result[int(row_str)] = parsed_days
-    return result
-
+    return {
+        "month_date":          month_date,
+        "ovo":                 norm_ovo(body.get("ovo", {})),
+        "sso":                 norm_sso(body.get("sso", {})),
+        "attendance":          norm_att(body.get("attendance", {})),
+        "vehicle_unit_rate":   body.get("vehicle_unit_rate"),
+        "contract_mile_rate":  body.get("contract_mile_rate"),
+    }
 
 def _xlsx_response(xlsx_bytes: bytes, filename: str):
-    """Wrap bytes in a Flask send_file response."""
     return send_file(
         io.BytesIO(xlsx_bytes),
         mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -122,144 +259,54 @@ def _xlsx_response(xlsx_bytes: bytes, filename: str):
         download_name=filename,
     )
 
-
 # ── Routes ────────────────────────────────────────────────────────────────────
-
 @app.route("/api/health", methods=["GET"])
 def health():
-    """Health check — confirm both templates are accessible."""
-    status = {
+    return jsonify({
+        "status": "ok",
         "ha0935_template": HA0935_TEMPLATE.is_file(),
         "hv0713_template": HV0713_TEMPLATE.is_file(),
-        "status": "ok",
-    }
-    return jsonify(status)
-
+    })
 
 @app.route("/api/export/ha0935", methods=["POST"])
 def export_ha0935():
-    """
-    Export endpoint for HA0935 Khan Transportation.
-
-    POST body (JSON):
-    {
-      "month_date": "2026-03-01",
-      "ovo": {
-        "Khan1": {"AM": {"2":1,"3":1,...}, "PM": {"2":1,...}},
-        ...
-        "Khan10": {...}
-      },
-      "sso": {
-        "Khan1": {"2":251.0,"3":243.0,...},
-        ...
-      },
-      "attendance": {
-        "13": {"2":2,"3":2,"4":"NS",...},
-        "14": {"2":2,...},
-        ...
-      },
-      "vehicle_unit_rate": 166.94,   // optional
-      "contract_mile_rate": 1.08     // optional
-    }
-
-    Returns: .xlsx file download
-    """
     if not request.is_json:
         return jsonify({"error": "Content-Type must be application/json"}), 400
-
-    body = request.get_json(silent=True) or {}
-
     try:
-        month_date = _parse_date(body.get("month_date", ""))
-        data = HA0935Data(
-            month_date         = month_date,
-            ovo                = _parse_ovo(body.get("ovo", {})),
-            sso                = _parse_sso(body.get("sso", {})),
-            attendance         = _parse_attendance(body.get("attendance", {})),
-            vehicle_unit_rate  = body.get("vehicle_unit_rate"),
-            contract_mile_rate = body.get("contract_mile_rate"),
-        )
-    except (ValueError, TypeError, KeyError) as e:
-        logger.warning("HA0935 request validation error: %s", e)
+        data = _parse_body(request.get_json(silent=True) or {})
+    except Exception as e:
         return jsonify({"error": str(e)}), 422
-
     try:
         xlsx_bytes = build_ha0935(HA0935_TEMPLATE, data)
     except FileNotFoundError as e:
-        logger.error("Template file missing: %s", e)
-        return jsonify({"error": "Template file not found on server"}), 500
-    except RuntimeError as e:
-        logger.error("Export error: %s", e)
         return jsonify({"error": str(e)}), 500
-
-    filename = f"HA0935_Khan_{month_date.strftime('%b%Y')}.xlsx"
-    logger.info("HA0935 exported: %s (%d bytes)", filename, len(xlsx_bytes))
+    except Exception as e:
+        logger.exception("HA0935 export error")
+        return jsonify({"error": str(e)}), 500
+    filename = f"HA0935_Khan_{data['month_date'].strftime('%b%Y')}.xlsx"
+    logger.info("HA0935 exported: %s", filename)
     return _xlsx_response(xlsx_bytes, filename)
-
 
 @app.route("/api/export/hv0713", methods=["POST"])
 def export_hv0713():
-    """
-    Export endpoint for HV0713 Priority Transportation.
-
-    POST body (JSON):
-    {
-      "month_date": "2026-03-01",
-      "ovo": {
-        "6770": {"AM": {"2":1,"3":1,...}, "PM": {"2":1,...}},
-        "6771": {"AM": {...}, "PM": {...}}
-      },
-      "sso": {
-        "6770": {"2":191.4,"3":188.4,...},
-        "6771": {"2":250.5,...}
-      },
-      "attendance": {
-        "13": {"2":2,"3":2,...},
-        ...
-      },
-      "vehicle_unit_rate": 166.94,   // optional
-      "contract_mile_rate": 1.08     // optional
-    }
-
-    Returns: .xlsx file download
-    """
     if not request.is_json:
         return jsonify({"error": "Content-Type must be application/json"}), 400
-
-    body = request.get_json(silent=True) or {}
-
     try:
-        month_date = _parse_date(body.get("month_date", ""))
-        data = HV0713Data(
-            month_date         = month_date,
-            ovo                = _parse_ovo(body.get("ovo", {})),
-            sso                = _parse_sso(body.get("sso", {})),
-            attendance         = _parse_attendance(body.get("attendance", {})),
-            vehicle_unit_rate  = body.get("vehicle_unit_rate"),
-            contract_mile_rate = body.get("contract_mile_rate"),
-        )
-    except (ValueError, TypeError, KeyError) as e:
-        logger.warning("HV0713 request validation error: %s", e)
+        data = _parse_body(request.get_json(silent=True) or {})
+    except Exception as e:
         return jsonify({"error": str(e)}), 422
-
     try:
         xlsx_bytes = build_hv0713(HV0713_TEMPLATE, data)
     except FileNotFoundError as e:
-        logger.error("Template file missing: %s", e)
-        return jsonify({"error": "Template file not found on server"}), 500
-    except RuntimeError as e:
-        logger.error("Export error: %s", e)
         return jsonify({"error": str(e)}), 500
-
-    filename = f"HV0713_Priority_{month_date.strftime('%b%Y')}.xlsx"
-    logger.info("HV0713 exported: %s (%d bytes)", filename, len(xlsx_bytes))
+    except Exception as e:
+        logger.exception("HV0713 export error")
+        return jsonify({"error": str(e)}), 500
+    filename = f"HV0713_Priority_{data['month_date'].strftime('%b%Y')}.xlsx"
+    logger.info("HV0713 exported: %s", filename)
     return _xlsx_response(xlsx_bytes, filename)
 
-
 # ── Dev server ────────────────────────────────────────────────────────────────
-
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    debug = os.environ.get("FLASK_DEBUG", "false").lower() == "true"
-    logger.info("Starting KTS Excel Export Backend on port %d (debug=%s)", port, debug)
-    app.run(host="0.0.0.0", port=port, debug=debug)
+    app.run(host="0.0.0.0", port=port, debug=False)
