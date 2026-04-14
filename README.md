@@ -24,7 +24,7 @@ Python Flask backend that generates exact-template Excel exports for:
 ## Local Development
 
 ```bash
-pip install -r requirements.txt
+pip  install -r requirements.txt
 python app.py
 # → http://localhost:5000
 
