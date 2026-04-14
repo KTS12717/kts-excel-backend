@@ -36,8 +36,30 @@ CORS(app, resources={r"/api/*": {"origins": ALLOWED_ORIGIN}})
 
 BASE_DIR       = Path(__file__).parent
 TEMPLATES_DIR  = BASE_DIR / "templates_excel"
-HA0935_TEMPLATE = TEMPLATES_DIR / "HA0935_template.xlsx"
-HV0713_TEMPLATE = TEMPLATES_DIR / "HV0713_template.xlsx"
+
+# Search for templates in multiple locations — handles different upload arrangements
+def _find_template(short_name: str, long_patterns: list) -> Path:
+    """Find a template file by trying several possible locations/names."""
+    # 1. Standard location
+    p = TEMPLATES_DIR / short_name
+    if p.is_file(): return p
+    # 2. Root folder with short name
+    p = BASE_DIR / short_name
+    if p.is_file(): return p
+    # 3. Root folder with long/original name
+    for pattern in long_patterns:
+        for f in BASE_DIR.glob(pattern):
+            return f
+    return TEMPLATES_DIR / short_name  # fallback (will raise FileNotFoundError)
+
+HA0935_TEMPLATE = _find_template(
+    "HA0935_template.xlsx",
+    ["HA0935*.xlsx", "HA0935_*.xlsx"]
+)
+HV0713_TEMPLATE = _find_template(
+    "HV0713_template.xlsx",
+    ["HV0713*.xlsx", "HV0713_*.xlsx"]
+)
 
 # ── Yellow-cell helpers ───────────────────────────────────────────────────────
 _YELLOW_SUFFIX = "FFFF99"
